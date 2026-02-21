@@ -1,3 +1,28 @@
+From 45a5086bbdcd65796786700b83dc50fc5b49f66c Mon Sep 17 00:00:00 2001
+From: Edwin Huallpa <hl7joao@Edwins-MacBook-Pro.local>
+Date: Sat, 21 Feb 2026 06:48:58 -0600
+Subject: [PATCH] A3: lottery scheduling + RESULTS.md
+
+---
+ Makefile       |  2 ++
+ RESULTS.md     | 77 ++++++++++++++++++++++++++++++++++++++++++++++++++
+ defs.h         |  3 ++
+ lotterybench.c | 54 +++++++++++++++++++++++++++++++++++
+ proc.c         | 77 ++++++++++++++++++++++++++++++++++++++------------
+ proc.h         |  2 ++
+ syscall.c      |  4 +++
+ syscall.h      |  2 ++
+ sysproc.c      | 17 +++++++++++
+ testlottery.c  | 37 ++++++++++++++++++++++++
+ trap.c         | 18 ++++++------
+ user.h         |  2 ++
+ usertests.c    | 27 ++++++++++++++++++
+ usys.S         |  2 ++
+ 14 files changed, 298 insertions(+), 26 deletions(-)
+ create mode 100644 RESULTS.md
+ create mode 100644 lotterybench.c
+ create mode 100644 testlottery.c
+
 diff --git a/Makefile b/Makefile
 index 09d790c..fb95ea8 100644
 --- a/Makefile
@@ -11,6 +36,89 @@ index 09d790c..fb95ea8 100644
  
  fs.img: mkfs README $(UPROGS)
  	./mkfs fs.img README $(UPROGS)
+diff --git a/RESULTS.md b/RESULTS.md
+new file mode 100644
+index 0000000..da6d5b7
+--- /dev/null
++++ b/RESULTS.md
+@@ -0,0 +1,77 @@
++# Lottery Scheduling Results
++
++## 1. Setup
++
++- OS: MIT xv6-public (x86)
++- Scheduler: Modified to Lottery Scheduling
++- PRNG: Simple in-kernel LCG
++- System calls added:
++  - settickets(int n)
++  - getrtime()
++
++## 2. Experiment Design
++
++Two CPU-bound child processes were created.
++
++Ticket configuration:
++- Child A: 10 tickets
++- Child B: 30 tickets
++
++Each child:
++- Calls settickets(n)
++- Runs a tight CPU-bound loop
++- Competes for CPU for a fixed duration using uptime()
++- Reports the increase in rtime (CPU time consumed)
++
++Expected theoretical CPU share ratio:
++
++30 / 10 = 3.0
++
++## 3. Results
++
++### Duration = 500 ticks
++
++Run 1:
++- A = 138
++- B = 384
++- Ratio = 2.78 (approx)
++
++Run 2:
++- A = 130
++- B = 377
++- Ratio = 2.90 (approx)
++
++Run 3:
++- A = 117
++- B = 395
++- Ratio = 3.38 (approx)
++
++### Duration = 2000 ticks
++
++Run 1:
++- A = 549
++- B = 1517
++- Ratio = 2.76 (approx)
++
++Run 2:
++- A = 530
++- B = 1474
++- Ratio = 2.78 (approx)
++
++Run 3:
++- A = 518
++- B = 1494
++- Ratio = 2.88 (approx)
++
++## 4. Observations
++
++- Lottery scheduling distributes CPU proportionally to ticket count.
++- Short runs show noticeable variance due to randomness.
++- Longer runs converge toward the theoretical ratio.
++- No starvation was observed.
++- All usertests passed successfully.
++
++## 5. Conclusion
++
++The lottery scheduler correctly enforces proportional CPU allocation.
++The implementation maintains scheduler invariants and operates safely under ptable.lock.
 diff --git a/defs.h b/defs.h
 index 82fb982..d7a2541 100644
 --- a/defs.h
@@ -32,6 +140,66 @@ index 82fb982..d7a2541 100644
  
  // timer.c
  void            timerinit(void);
+diff --git a/lotterybench.c b/lotterybench.c
+new file mode 100644
+index 0000000..57a1a3c
+--- /dev/null
++++ b/lotterybench.c
+@@ -0,0 +1,54 @@
++#include "types.h"
++#include "stat.h"
++#include "user.h"
++
++static void
++child_run(char *name, int tickets, int duration_ticks)
++{
++  int start_u = uptime();
++  int end_u = start_u + duration_ticks;
++
++  int rt0 = getrtime();
++  settickets(tickets);
++
++  volatile int x = 0;
++  while(uptime() < end_u){
++    x = x + 1;
++  }
++
++  int rt1 = getrtime();
++  int gained = rt1 - rt0;
++
++  printf(1, "%s tickets=%d rtime_gained=%d\n", name, tickets, gained);
++  exit();
++}
++
++int
++main(int argc, char *argv[])
++{
++  int duration = 500;   // increase to 1000+ for smoother ratios
++  int a = 10;
++  int b = 30;
++
++  if(argc >= 2) duration = atoi(argv[1]);
++  if(argc >= 3) a = atoi(argv[2]);
++  if(argc >= 4) b = atoi(argv[3]);
++
++  printf(1, "lotterybench: duration=%d A=%d B=%d\n", duration, a, b);
++
++  int pidA = fork();
++  if(pidA == 0){
++    child_run("Child A", a, duration);
++  }
++
++  int pidB = fork();
++  if(pidB == 0){
++    child_run("Child B", b, duration);
++  }
++
++  wait();
++  wait();
++
++  printf(1, "Done.\n");
++  exit();
++}
 diff --git a/proc.c b/proc.c
 index 806b1b1..c475b65 100644
 --- a/proc.c
@@ -242,6 +410,49 @@ index 0686d29..a5c9b1c 100644
 +{
 +  return getrtime();
 +}
+diff --git a/testlottery.c b/testlottery.c
+new file mode 100644
+index 0000000..0a6d665
+--- /dev/null
++++ b/testlottery.c
+@@ -0,0 +1,37 @@
++#include "types.h"
++#include "stat.h"
++#include "user.h"
++
++int
++main(void)
++{
++  int pid;
++  int i;
++
++  printf(1, "Parent setting tickets to 10\n");
++  settickets(10);
++
++  for(i = 0; i < 2; i++){
++    pid = fork();
++    if(pid == 0){
++      if(i == 0){
++        printf(1, "Child 1 setting tickets to 1\n");
++        settickets(1);
++      } else {
++        printf(1, "Child 2 setting tickets to 20\n");
++        settickets(20);
++      }
++
++      volatile int j;
++      for(j = 0; j < 100000000; j++);  // CPU work
++
++      printf(1, "Child %d done\n", i+1);
++      exit();
++    }
++  }
++
++  while(wait() > 0);
++
++  printf(1, "All done\n");
++  exit();
++}
 diff --git a/trap.c b/trap.c
 index 41c66eb..c4eadc1 100644
 --- a/trap.c
@@ -342,3 +553,6 @@ index 8bfd8a1..49fdda0 100644
  SYSCALL(uptime)
 +SYSCALL(settickets)
 +SYSCALL(getrtime)
+-- 
+2.50.1 (Apple Git-155)
+
