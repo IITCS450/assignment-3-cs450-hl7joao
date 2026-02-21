@@ -1,0 +1,344 @@
+diff --git a/Makefile b/Makefile
+index 09d790c..fb95ea8 100644
+--- a/Makefile
++++ b/Makefile
+@@ -181,6 +181,8 @@ UPROGS=\
+ 	_usertests\
+ 	_wc\
+ 	_zombie\
++        _testlottery\
++	_lotterybench\
+ 
+ fs.img: mkfs README $(UPROGS)
+ 	./mkfs fs.img README $(UPROGS)
+diff --git a/defs.h b/defs.h
+index 82fb982..d7a2541 100644
+--- a/defs.h
++++ b/defs.h
+@@ -108,6 +108,8 @@ void            exit(void);
+ int             fork(void);
+ int             growproc(int);
+ int             kill(int);
++int             settickets(int);
++int             getrtime(void);
+ struct cpu*     mycpu(void);
+ struct proc*    myproc();
+ void            pinit(void);
+@@ -155,6 +157,7 @@ int             argstr(int, char**);
+ int             fetchint(uint, int*);
+ int             fetchstr(uint, char**);
+ void            syscall(void);
++int             sys_settickets(void);
+ 
+ // timer.c
+ void            timerinit(void);
+diff --git a/proc.c b/proc.c
+index 806b1b1..c475b65 100644
+--- a/proc.c
++++ b/proc.c
+@@ -18,6 +18,15 @@ int nextpid = 1;
+ extern void forkret(void);
+ extern void trapret(void);
+ 
++static uint rand_state = 1;
++
++static uint
++rand_next(void)
++{
++  rand_state = rand_state * 1664525 + 1013904223;
++  return rand_state;
++}
++
+ static void wakeup1(void *chan);
+ 
+ void
+@@ -64,6 +73,11 @@ myproc(void) {
+   popcli();
+   return p;
+ }
++int
++getrtime(void)
++{
++  return myproc()->rtime;
++}
+ 
+ //PAGEBREAK: 32
+ // Look in the process table for an UNUSED proc.
+@@ -88,6 +102,8 @@ allocproc(void)
+ found:
+   p->state = EMBRYO;
+   p->pid = nextpid++;
++  p->rtime = 0;
++  p->tickets = 1;
+ 
+   release(&ptable.lock);
+ 
+@@ -198,6 +214,7 @@ fork(void)
+   }
+   np->sz = curproc->sz;
+   np->parent = curproc;
++  np->tickets = curproc->tickets;
+   *np->tf = *curproc->tf;
+ 
+   // Clear %eax so that fork returns 0 in the child.
+@@ -325,33 +342,43 @@ scheduler(void)
+   struct proc *p;
+   struct cpu *c = mycpu();
+   c->proc = 0;
+-  
++
+   for(;;){
+-    // Enable interrupts on this processor.
+     sti();
+ 
+-    // Loop over process table looking for process to run.
+     acquire(&ptable.lock);
++
++    int total = 0;
+     for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+-      if(p->state != RUNNABLE)
+-        continue;
++      if(p->state == RUNNABLE)
++        total += p->tickets;
++    }
++
++    if(total > 0){
++      uint winner = rand_next() % total;
++
++      int running_sum = 0;
++      for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
++        if(p->state != RUNNABLE)
++          continue;
++
++        running_sum += p->tickets;
+ 
+-      // Switch to chosen process.  It is the process's job
+-      // to release ptable.lock and then reacquire it
+-      // before jumping back to us.
+-      c->proc = p;
+-      switchuvm(p);
+-      p->state = RUNNING;
++        if(running_sum > (int)winner){
++          c->proc = p;
++          switchuvm(p);
++          p->state = RUNNING;
+ 
+-      swtch(&(c->scheduler), p->context);
+-      switchkvm();
++          swtch(&(c->scheduler), p->context);
++          switchkvm();
+ 
+-      // Process is done running for now.
+-      // It should have changed its p->state before coming back.
+-      c->proc = 0;
++          c->proc = 0;
++          break;
++        }
++      }
+     }
+-    release(&ptable.lock);
+ 
++    release(&ptable.lock);
+   }
+ }
+ 
+@@ -485,7 +512,6 @@ kill(int pid)
+   for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+     if(p->pid == pid){
+       p->killed = 1;
+-      // Wake process from sleep if necessary.
+       if(p->state == SLEEPING)
+         p->state = RUNNABLE;
+       release(&ptable.lock);
+@@ -496,6 +522,21 @@ kill(int pid)
+   return -1;
+ }
+ 
++int
++settickets(int n)
++{
++  struct proc *p = myproc();
++
++  if(n < 1)
++    return -1;
++
++  acquire(&ptable.lock);
++  p->tickets = n;
++  release(&ptable.lock);
++
++  return 0;
++}
++
+ //PAGEBREAK: 36
+ // Print a process listing to console.  For debugging.
+ // Runs when user types ^P on console.
+diff --git a/proc.h b/proc.h
+index 1647114..1cb7816 100644
+--- a/proc.h
++++ b/proc.h
+@@ -41,6 +41,8 @@ struct proc {
+   char *kstack;                // Bottom of kernel stack for this process
+   enum procstate state;        // Process state
+   int pid;                     // Process ID
++  int tickets;                 // Lotery tickets (>=1)
++  uint rtime;
+   struct proc *parent;         // Parent process
+   struct trapframe *tf;        // Trap frame for current syscall
+   struct context *context;     // swtch() here to run process
+diff --git a/syscall.c b/syscall.c
+index ee85261..5ac26d2 100644
+--- a/syscall.c
++++ b/syscall.c
+@@ -103,6 +103,8 @@ extern int sys_unlink(void);
+ extern int sys_wait(void);
+ extern int sys_write(void);
+ extern int sys_uptime(void);
++extern int sys_settickets(void);
++extern int sys_getrtime(void);
+ 
+ static int (*syscalls[])(void) = {
+ [SYS_fork]    sys_fork,
+@@ -126,6 +128,8 @@ static int (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_settickets] sys_settickets,
++[SYS_getrtime] sys_getrtime,
+ };
+ 
+ void
+diff --git a/syscall.h b/syscall.h
+index bc5f356..da440b5 100644
+--- a/syscall.h
++++ b/syscall.h
+@@ -20,3 +20,5 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_settickets 22
++#define SYS_getrtime 23
+diff --git a/sysproc.c b/sysproc.c
+index 0686d29..a5c9b1c 100644
+--- a/sysproc.c
++++ b/sysproc.c
+@@ -89,3 +89,20 @@ sys_uptime(void)
+   release(&tickslock);
+   return xticks;
+ }
++
++int
++sys_settickets(void)
++{
++  int n;
++
++  if(argint(0, &n) < 0)
++    return -1;
++
++  return settickets(n);
++}
++
++int
++sys_getrtime(void)
++{
++  return getrtime();
++}
+diff --git a/trap.c b/trap.c
+index 41c66eb..c4eadc1 100644
+--- a/trap.c
++++ b/trap.c
+@@ -48,14 +48,16 @@ trap(struct trapframe *tf)
+ 
+   switch(tf->trapno){
+   case T_IRQ0 + IRQ_TIMER:
+-    if(cpuid() == 0){
+-      acquire(&tickslock);
+-      ticks++;
+-      wakeup(&ticks);
+-      release(&tickslock);
+-    }
+-    lapiceoi();
+-    break;
++  if(cpuid() == 0){
++    acquire(&tickslock);
++    ticks++;
++    wakeup(&ticks);
++    release(&tickslock);
++  }
++  if(myproc() && myproc()->state == RUNNING)
++    myproc()->rtime++;
++  lapiceoi();
++  break;
+   case T_IRQ0 + IRQ_IDE:
+     ideintr();
+     lapiceoi();
+diff --git a/user.h b/user.h
+index 4f99c52..57da765 100644
+--- a/user.h
++++ b/user.h
+@@ -23,6 +23,8 @@ int getpid(void);
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++int settickets(int);
++int getrtime(void);
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+diff --git a/usertests.c b/usertests.c
+index a1e97e7..1414ba9 100644
+--- a/usertests.c
++++ b/usertests.c
+@@ -1745,9 +1745,35 @@ rand()
+   return randstate;
+ }
+ 
++void
++getrtimetest(void)
++{
++  int t1, t2;
++
++  printf(1, "getrtime test\n");
++
++  t1 = getrtime();
++  if(t1 < 0){
++    printf(1, "getrtime returned %d\n", t1);
++    exit();
++  }
++
++  for(volatile int i = 0; i < 20000000; i++)
++    ;
++
++  t2 = getrtime();
++  if(t2 < t1){
++    printf(1, "getrtime went backwards: %d -> %d\n", t1, t2);
++    exit();
++  }
++
++  printf(1, "getrtime ok: %d -> %d\n", t1, t2);
++}
++
+ int
+ main(int argc, char *argv[])
+ {
++
+   printf(1, "usertests starting\n");
+ 
+   if(open("usertests.ran", 0) >= 0){
+@@ -1757,6 +1783,7 @@ main(int argc, char *argv[])
+   close(open("usertests.ran", O_CREATE));
+ 
+   argptest();
++  getrtimetest();
+   createdelete();
+   linkunlink();
+   concreate();
+diff --git a/usys.S b/usys.S
+index 8bfd8a1..49fdda0 100644
+--- a/usys.S
++++ b/usys.S
+@@ -29,3 +29,5 @@ SYSCALL(getpid)
+ SYSCALL(sbrk)
+ SYSCALL(sleep)
+ SYSCALL(uptime)
++SYSCALL(settickets)
++SYSCALL(getrtime)
